@@ -1,74 +1,114 @@
 #!/bin/bash
 
-# reset shell colors
-tput init
-
-# https://stackoverflow.com/questions/59895/how-to-get-the-source-directory-of-a-bash-script-from-within-the-script-itself
-SOURCE="${BASH_SOURCE[0]}"
-while [ -h "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
-  PROJECT_ROOT="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-  SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$PROJECT_ROOT/$SOURCE" # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
-done
-PROJECT_ROOT="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-
-# required imports
-source "${PROJECT_ROOT}"/variables/manifest.sh
-source "${PROJECT_ROOT}"/utils/manifest.sh
-source "${PROJECT_ROOT}"/lib/manifest.sh
-
-# user configs file
-if [[ ! -e "${PROJECT_ROOT}"/config ]]; then
-  cat << EOF > "${PROJECT_ROOT}"/config
-deploy_password=${deploy_password}
-mysql_root_password=${mysql_root_password}
-db_pass=${db_pass}
-EOF
+# Verificar se o script está sendo executado como root
+if [ "$(id -u)" -ne "0" ]; then
+    echo "Este script deve ser executado como root."
+    exit 1
 fi
 
-# this file has passwords
-sudo su - root <<EOF
-chown root:root "${PROJECT_ROOT}"/config
-chmod 700 "${PROJECT_ROOT}"/config
-EOF
-source "${PROJECT_ROOT}"/config
+echo "Iniciando configuração do Whaticket-Saas-2024..."
 
-# interactive CLI
-inquiry_options
+# Atualizar o sistema
+apt update && apt upgrade -y
 
-# dependencies related
-system_update
-system_set_timezone
-system_set_ufw
-system_node_install
-system_pm2_install
-system_docker_install
-system_puppeteer_dependencies
-system_snapd_install
-system_nginx_install
-system_certbot_install
+# Instalar dependências do sistema
+apt install -y sudo git curl nginx software-properties-common
 
-# system config
-system_create_user
+# Instalar Certbot para SSL
+add-apt-repository ppa:certbot/certbot -y
+apt update
+apt install -y certbot python3-certbot-nginx
 
-# backend related
-system_unzip_whaticket
-backend_chrome_install
-backend_set_env
-backend_redis_create
-backend_node_dependencies
-backend_db_migrate
-backend_db_seed
-backend_start_pm2
-backend_nginx_setup
+# Configurar o banco de dados MySQL
+echo "Configurando o MySQL..."
+mysql -u root -e "
+CREATE DATABASE whaticket;
+CREATE USER 'macb'@'localhost' IDENTIFIED BY 'b18073518B@123';
+GRANT ALL PRIVILEGES ON whaticket.* TO 'macb'@'localhost';
+FLUSH PRIVILEGES;"
 
-# frontend related
-frontend_set_env
-frontend_node_dependencies
-frontend_start_pm2
-frontend_nginx_setup
+# Configuração dos arquivos .env do backend e frontend
+echo "Configurando arquivos .env..."
+cd backend
+cp .env.example .env
+sed -i 's/DB_USER=root/DB_USER=macb/g' .env
+sed -i 's/DB_PASS=/DB_PASS=b18073518B@123/g' .env
+sed -i 's/DB_NAME=whaticket/DB_NAME=whaticket/g' .env
+sed -i 's#BACKEND_URL=http://localhost:3333#BACKEND_URL=https://api.macbvendas.com.br#g' .env
 
-# network related
-system_nginx_conf
-system_nginx_restart
-system_certbot_setup
+cd ../frontend
+cp .env.example .env
+sed -i 's#REACT_APP_BACKEND_URL=http://localhost:3333#REACT_APP_BACKEND_URL=https://api.macbvendas.com.br#g' .env
+
+# Construir o frontend
+echo "Construindo o frontend..."
+cd ../frontend
+npm install
+npm run build
+
+# Configurar Nginx
+echo "Configurando o Nginx..."
+cd ../
+cat > /etc/nginx/sites-available/whaticket <<EOL
+server {
+    listen 80;
+    server_name app.macbvendas.com.br api.macbvendas.com.br;
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name app.macbvendas.com.br;
+
+    ssl_certificate /etc/letsencrypt/live/app.macbvendas.com.br/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/app.macbvendas.com.br/privkey.pem;
+
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name api.macbvendas.com.br;
+
+    ssl_certificate /etc/letsencrypt/live/api.macbvendas.com.br/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.macbvendas.com.br/privkey.pem;
+
+    location / {
+        proxy_pass http://localhost:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+    }
+}
+EOL
+
+# Obter certificados SSL
+echo "Obtendo certificados SSL..."
+certbot --nginx -d app.macbvendas.com.br -d api.macbvendas.com.br
+
+# Ativar configuração do Nginx e reiniciar
+ln -s /etc/nginx/sites-available/whaticket /etc/nginx/sites-enabled/
+nginx -t
+systemctl restart nginx
+
+# Iniciar os serviços do backend e frontend
+echo "Iniciando os serviços..."
+cd backend
+systemctl start whaticket-backend
+
+cd ../frontend
+systemctl start whaticket-frontend
+
+echo "Configuração completa. Acesse o frontend em https://app.macbvendas.com.br e o backend em https://api.macbvendas.com.br."
